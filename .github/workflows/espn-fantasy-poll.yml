@@ -1,0 +1,95 @@
+name: ESPN Fantasy Poll
+
+# Cheap, no-LLM watchdog. Runs hourly, does one round of ESPN reads (no
+# Claude invocation, no cost beyond that), and diffs the result against the
+# last poll. If anything in the exhaustive condition list documented in
+# `cmd_poll` (espn_actions.py) has newly become true — a starter's status
+# worsened or cleared, a bench player now out-projects a starter, the wire
+# produced a real upgrade, a tracked waiver player cleared, a new trade came
+# in, a pending trade is about to expire, or a new snapshot error appeared —
+# it dispatches the full "ESPN Fantasy Check" workflow (espn-fantasy-check.yml)
+# early instead of waiting for its next daily run.
+on:
+  schedule:
+    - cron: '0 * * * *'   # hourly
+  workflow_dispatch: {}   # manual "Run workflow" button for testing
+
+permissions:
+  contents: write   # to commit the updated poll state
+  actions: write     # to dispatch espn-fantasy-check.yml early
+
+concurrency:
+  group: espn-fantasy-poll
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Check whether the last dispatched special run failed
+        # cmd_poll only tracks whether a condition is newly true, not
+        # whether the run it previously dispatched for that condition
+        # actually succeeded. Without this check, a downstream failure
+        # (e.g. the bot-actor rejection espn-fantasy-check.yml hit before
+        # allowed_bots was set) permanently suppresses re-alerting on that
+        # condition, since poll-state.json already has it marked "open".
+        # If the most recent run WE dispatched (workflow_dispatch, actor
+        # github-actions[bot]) failed, clear open_reasons below so this
+        # poll's still-true conditions look new again and get re-dispatched.
+        id: lastdispatch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          CONCLUSION=$(gh api "repos/${{ github.repository }}/actions/workflows/espn-fantasy-check.yml/runs?event=workflow_dispatch&per_page=10" \
+            --jq '[.workflow_runs[] | select(.actor.login == "github-actions[bot]")] | sort_by(.created_at) | last | .conclusion // "none"')
+          echo "conclusion=$CONCLUSION" >> "$GITHUB_OUTPUT"
+          echo "Last poller-dispatched espn-fantasy-check.yml run concluded: $CONCLUSION"
+
+      - name: Poll ESPN state for a special-run condition
+        id: poll
+        env:
+          ESPN_S2: ${{ secrets.ESPN_S2 }}
+          ESPN_SWID: ${{ secrets.ESPN_SWID }}
+          ESPN_LEAGUE_ID: ${{ secrets.ESPN_LEAGUE_ID }}
+          ESPN_TEAM_ID: ${{ secrets.ESPN_TEAM_ID }}
+          ESPN_SEASON_YEAR: ${{ secrets.ESPN_SEASON_YEAR }}
+        run: |
+          chmod +x ./espn-act
+          mkdir -p .github/state
+          if [ "${{ steps.lastdispatch.outputs.conclusion }}" = "failure" ] && [ -f .github/state/poll-state.json ]; then
+            echo "Last special-run dispatch failed — clearing open_reasons so its conditions re-trigger."
+            jq '.open_reasons = {}' .github/state/poll-state.json > /tmp/poll-state.json
+            mv /tmp/poll-state.json .github/state/poll-state.json
+          fi
+          ./espn-act poll --state .github/state/poll-state.json
+
+      - name: Dispatch a special ESPN Fantasy Check run
+        if: steps.poll.outputs.trigger == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REASONS: ${{ steps.poll.outputs.reasons }}
+        run: |
+          echo "Triggering an early fantasy check for:"
+          echo "$REASONS"
+          gh workflow run espn-fantasy-check.yml \
+            --repo "${{ github.repository }}" \
+            -f reason="$REASONS"
+
+      - name: Commit updated poll state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/state/poll-state.json
+          if git diff --cached --quiet; then
+            echo "No poll-state change to commit."
+          else
+            git commit -m "Update ESPN poll state [skip ci]"
+            git pull --rebase origin "${GITHUB_REF_NAME}"
+            git push
+          fi

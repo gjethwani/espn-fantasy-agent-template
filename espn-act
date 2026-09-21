@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Thin launcher for espn_actions.py in a throwaway uv environment.
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+exec uv run --no-project --with "espn-api>=0.44.0" --with requests \
+  python "$here/espn_actions.py" "$@"

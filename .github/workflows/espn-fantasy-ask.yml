@@ -1,0 +1,77 @@
+name: ESPN Fantasy Ask
+
+# Manual-only Q&A. Trigger it from the Actions tab ("Run workflow") with a
+# question about your team or the league — waiver strategy, a specific
+# player, a trade idea, standings, whatever. It reads the same league data
+# the other workflows do but never makes a move: no set-lineup, add-drop,
+# waiver, or trade call is allowed to execute here.
+on:
+  workflow_dispatch:
+    inputs:
+      question:
+        description: "Your question about the team or league"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  fantasy-ask:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Fetch ESPN state
+        continue-on-error: true
+        env:
+          ESPN_S2: ${{ secrets.ESPN_S2 }}
+          ESPN_SWID: ${{ secrets.ESPN_SWID }}
+          ESPN_LEAGUE_ID: ${{ secrets.ESPN_LEAGUE_ID }}
+          ESPN_TEAM_ID: ${{ secrets.ESPN_TEAM_ID }}
+          ESPN_SEASON_YEAR: ${{ secrets.ESPN_SEASON_YEAR }}
+        run: |
+          chmod +x ./espn-act
+          ./espn-act show --fa-size 75 --out "$GITHUB_WORKSPACE/espn-data.json"
+
+      - name: Run Claude Code
+        env:
+          # Read-only use: the agent's Bash tools call ./espn-act for fresh
+          # reads (show/find) only. It is instructed below never to pass
+          # --execute, so these creds should never reach a write call, but
+          # they're still needed for reads to work at all.
+          ESPN_S2: ${{ secrets.ESPN_S2 }}
+          ESPN_SWID: ${{ secrets.ESPN_SWID }}
+          ESPN_LEAGUE_ID: ${{ secrets.ESPN_LEAGUE_ID }}
+          ESPN_TEAM_ID: ${{ secrets.ESPN_TEAM_ID }}
+          ESPN_SEASON_YEAR: ${{ secrets.ESPN_SEASON_YEAR }}
+        # Pinned to v1.0.217 — see espn-fantasy-check.yml for why (v1.0.218's
+        # native installer fails silently on ubuntu-latest).
+        uses: anthropics/claude-code-action@9c5ddab2e6d17b83ea679153b31f1d5f023cf636
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
+          # PROMPT INTENTIONALLY LEFT BLANK.
+          # See README.md -> "Write your prompts". This one carries a real
+          # safety requirement: your prompt MUST forbid passing --execute to
+          # set-lineup/add-drop/waiver/trade-propose/trade-respond, or this
+          # "read-only" Q&A workflow can actually make roster moves. It also
+          # needs to reference ${{ github.event.inputs.question }} (the
+          # question you type in when running the workflow) and instruct
+          # writing the answer to ./answer.md for the "Print answer" step
+          # below to pick up.
+          prompt: ""
+          claude_args: |
+            --allowedTools "Read,Glob,Grep,Bash"
+
+      - name: Print answer
+        if: always()
+        run: |
+          if [ -f answer.md ]; then
+            cat answer.md
+          else
+            echo "No answer.md was written — see the 'Run Claude Code' step above for what happened."
+          fi

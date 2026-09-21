@@ -1,0 +1,75 @@
+name: ESPN Fantasy Check
+
+on:
+  schedule:
+    # Daily at 13:00 UTC. Adjust the hour to your timezone if you like.
+    - cron: '0 13 * * *'
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: >-
+          Why this run was triggered outside the daily schedule (filled in
+          by espn-fantasy-poll.yml; leave blank for a manual run).
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  issues: write            # lets Claude open/update an issue with results
+
+jobs:
+  fantasy-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Fetch ESPN state
+        # ./espn-act (see espn_actions.py) reads the full league via espn_api and
+        # writes ./espn-data.json. The same script is what the agent uses to make
+        # moves. No MCP server: espn-fantasy-mcp on PyPI is a *baseball* server
+        # (games/flb) and cannot touch an ffl league.
+        continue-on-error: true
+        env:
+          ESPN_S2: ${{ secrets.ESPN_S2 }}
+          ESPN_SWID: ${{ secrets.ESPN_SWID }}
+          ESPN_LEAGUE_ID: ${{ secrets.ESPN_LEAGUE_ID }}
+          ESPN_TEAM_ID: ${{ secrets.ESPN_TEAM_ID }}
+          ESPN_SEASON_YEAR: ${{ secrets.ESPN_SEASON_YEAR }}
+        run: |
+          chmod +x ./espn-act
+          ./espn-act show --out "$GITHUB_WORKSPACE/espn-data.json"
+
+      - name: Run Claude Code
+        env:
+          # The agent's Bash tools call ./espn-act, which needs these.
+          ESPN_S2: ${{ secrets.ESPN_S2 }}
+          ESPN_SWID: ${{ secrets.ESPN_SWID }}
+          ESPN_LEAGUE_ID: ${{ secrets.ESPN_LEAGUE_ID }}
+          ESPN_TEAM_ID: ${{ secrets.ESPN_TEAM_ID }}
+          ESPN_SEASON_YEAR: ${{ secrets.ESPN_SEASON_YEAR }}
+        # Pinned to v1.0.217. v1.0.218 (current `@v1`) ships Claude Code 2.1.265,
+        # whose native installer fails silently on ubuntu-latest — every run dies
+        # with "native binary not found". See anthropics/claude-code-action#1817.
+        uses: anthropics/claude-code-action@9c5ddab2e6d17b83ea679153b31f1d5f023cf636
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
+          # espn-fantasy-poll.yml dispatches this workflow via `gh workflow
+          # run` using its own GITHUB_TOKEN, which makes the run's actor
+          # github-actions[bot] instead of a human. claude-code-action
+          # refuses bot-initiated runs by default (to stop an untrusted App
+          # from driving it) unless the bot is explicitly allowlisted here.
+          allowed_bots: "github-actions[bot]"
+          # PROMPT INTENTIONALLY LEFT BLANK.
+          # This is the entire strategy for how the agent runs your team --
+          # write your own. See README.md -> "Write your prompts" for what
+          # it needs to cover, the tools/data available to it, and an
+          # example of how to surface github.event.inputs.reason (the
+          # context espn-fantasy-poll.yml passes in on a special run).
+          prompt: ""
+          claude_args: |
+            --allowedTools "Read,Glob,Grep,Bash"
